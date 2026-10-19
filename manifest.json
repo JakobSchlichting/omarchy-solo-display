@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "js.solo-display",
+  "name": "Solo Display",
+  "version": "0.1.0",
+  "author": "js",
+  "description": "Indicator toggle that turns off all displays but one, gathers workspaces onto it, and restores the full setup afterwards",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "SoloDisplay.qml"
+  },
+  "barWidget": {
+    "displayName": "Solo Display",
+    "description": "Keep one display on and gather workspaces onto it",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "monitor": "",
+      "workspaces": "1-5",
+      "suspendWidget": "air.workspaces",
+      "replaceWith": "omarchy.workspaces"
+    },
+    "schema": [
+      {
+        "key": "monitor",
+        "type": "string",
+        "label": "Display",
+        "defaultValue": "",
+        "description": "Connector to keep on, e.g. DP-1 or HDMI-A-1. Empty uses the focused display. Right-click the indicator to pick one."
+      },
+      {
+        "key": "workspaces",
+        "type": "string",
+        "label": "Workspaces",
+        "defaultValue": "1-5",
+        "description": "Workspaces pinned to that display while solo mode is on: a comma list and/or ranges, e.g. 1-5."
+      },
+      {
+        "key": "suspendWidget",
+        "type": "string",
+        "label": "Suspend widget",
+        "defaultValue": "air.workspaces",
+        "description": "Bar widget taken off the bar while solo mode is on and put back, settings intact, afterwards. Empty keeps the bar as is."
+      },
+      {
+        "key": "replaceWith",
+        "type": "string",
+        "label": "Stand-in widget",
+        "defaultValue": "omarchy.workspaces",
+        "description": "Widget shown in the suspended widget's place while solo mode is on. Empty leaves the slot empty."
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Always Show",
+        "description": "Show the indicator while inactive without waiting for hover.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

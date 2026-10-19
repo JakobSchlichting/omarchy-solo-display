@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Minimal stand-in for hyprctl, backed by a JSON world file.
+
+Models just enough of Hyprland for solo-display: enabled/disabled monitors
+(driven by the generated toggle Lua on `reload`), workspaces living on
+monitors, the active workspace per monitor, focus, and the two dispatchers the
+script uses. Every dispatch is appended to the world's "log".
+"""
+import json
+import os
+import re
+import sys
+
+WORLD = os.environ["FAKE_HYPR_WORLD"]
+FLAG = os.environ["SOLO_DISPLAY_FLAG_FILE"]
+
+
+def load():
+    with open(WORLD) as f:
+        return json.load(f)
+
+
+def save(world):
+    with open(WORLD, "w") as f:
+        json.dump(world, f, indent=2)
+
+
+def enabled(world):
+    return [m for m in world["monitors"] if not m.get("disabled")]
+
+
+def ensure_active(world, mon):
+    """Give a monitor a visible workspace, as Hyprland does."""
+    names = {w["id"] for w in world["workspaces"]}
+    if any(w["id"] == mon.get("active") for w in world["workspaces"] if w["monitor"] == mon["name"]):
+        return
+    own = sorted(w["id"] for w in world["workspaces"] if w["monitor"] == mon["name"])
+    if own:
+        mon["active"] = own[0]
+        return
+    n = 1
+    while n in names:
+        n += 1
+    world["workspaces"].append({"id": n, "monitor": mon["name"], "windows": 0})
+    mon["active"] = n
+
+
+def gc(world):
+    """Empty workspaces vanish once nothing shows them."""
+    shown = {m.get("active") for m in enabled(world)}
+    world["workspaces"] = [w for w in world["workspaces"] if w["windows"] > 0 or w["id"] in shown]
+
+
+def focus_monitor(world, name):
+    for m in world["monitors"]:
+        m["focused"] = m["name"] == name
+
+
+def monitor_json(world, m):
+    return {
+        "name": m["name"],
+        "disabled": bool(m.get("disabled")),
+        "focused": bool(m.get("focused")),
+        "activeWorkspace": {"id": m.get("active", -1), "name": str(m.get("active", ""))},
+    }
+
+
+def reload(world):
+    disabled = set()
+    if os.path.exists(FLAG):
+        disabled = set(re.findall(r'output = "([^"]+)", disabled = true', open(FLAG).read()))
+    for m in world["monitors"]:
+        if m.get("connected", True):
+            m["disabled"] = m["name"] in disabled
+    live = enabled(world)
+    for w in world["workspaces"]:
+        if not any(m["name"] == w["monitor"] for m in live):
+            w["monitor"] = live[0]["name"]
+    if not any(m.get("focused") for m in live):
+        focus_monitor(world, live[0]["name"])
+    for m in live:
+        ensure_active(world, m)
+    gc(world)
+
+
+def dispatch(world, expr):
+    world["log"].append(expr)
+    mv = re.fullmatch(r'hl\.dsp\.workspace\.move\(\{ workspace = "(\d+)", monitor = "([^"]+)" \}\)', expr)
+    fm = re.fullmatch(r'hl\.dsp\.focus\(\{ monitor = "([^"]+)" \}\)', expr)
+    fw = re.fullmatch(r'hl\.dsp\.focus\(\{ workspace = "(\d+)" \}\)', expr)
+    if mv:
+        wid, dest = int(mv.group(1)), mv.group(2)
+        ws = next((w for w in world["workspaces"] if w["id"] == wid), None)
+        if ws is None:
+            return
+        src = ws["monitor"]
+        ws["monitor"] = dest
+        for m in world["monitors"]:
+            if m["name"] == dest:
+                m["active"] = wid
+        for m in world["monitors"]:
+            if m["name"] == src and m.get("active") == wid:
+                m["active"] = None
+                ensure_active(world, m)
+        gc(world)
+    elif fm:
+        focus_monitor(world, fm.group(1))
+    elif fw:
+        wid = int(fw.group(1))
+        ws = next((w for w in world["workspaces"] if w["id"] == wid), None)
+        if ws is None:
+            mon = next(m for m in world["monitors"] if m.get("focused"))
+            world["workspaces"].append({"id": wid, "monitor": mon["name"], "windows": 0})
+        else:
+            mon = next(m for m in world["monitors"] if m["name"] == ws["monitor"])
+        mon["active"] = wid
+        focus_monitor(world, mon["name"])
+        gc(world)
+    else:
+        sys.exit(f"fake-hyprctl: unknown dispatch {expr}")
+
+
+def main():
+    world = load()
+    args = [a for a in sys.argv[1:] if a != "-j"]
+    cmd = args[0]
+    if cmd == "monitors":
+        mons = world["monitors"] if args[1:] == ["all"] else enabled(world)
+        print(json.dumps([monitor_json(world, m) for m in mons if m.get("connected", True)]))
+    elif cmd == "workspaces":
+        print(json.dumps(world["workspaces"]))
+    elif cmd == "reload":
+        reload(world)
+        save(world)
+        print("ok")
+    elif cmd == "dispatch":
+        dispatch(world, args[1])
+        save(world)
+        print("ok")
+    else:
+        sys.exit(f"fake-hyprctl: unsupported {cmd}")
+
+
+main()

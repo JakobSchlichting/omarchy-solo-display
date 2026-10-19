@@ -1,0 +1,415 @@
+#!/bin/bash
+
+# Solo display: turn off every display except one, gather workspaces onto it,
+# and put the full multi-display setup back when turned off again.
+#
+#   solo-display on [--monitor <connector>]   e.g. --monitor DP-1
+#   solo-display off
+#   solo-display toggle [--monitor <connector>]
+#   solo-display status                       prints JSON
+#
+# Settings come from the js.solo-display entry in ~/.config/omarchy/shell.json:
+#   monitor        connector to keep (DP-1, HDMI-A-1, ...); default: focused one
+#   workspaces     workspaces pinned to it while active; default "1-5"
+#   suspendWidget  bar widget swapped out while active; default "air.workspaces"
+#   replaceWith    widget shown in its place; default "omarchy.workspaces"
+#
+# Disabling displays goes through Omarchy's Hyprland toggle directory
+# (~/.local/state/omarchy/toggles/hypr/*.lua is loaded after monitors.lua on
+# every reload), so the layout survives `hyprctl reload` and theme switches.
+
+set -euo pipefail
+
+PLUGIN_ID="${SOLO_DISPLAY_PLUGIN_ID:-js.solo-display}"
+CONFIG_FILE="${SOLO_DISPLAY_SHELL_CONFIG:-$HOME/.config/omarchy/shell.json}"
+STATE_DIR="${SOLO_DISPLAY_STATE_DIR:-$HOME/.local/state/solo-display}"
+STATE_FILE="$STATE_DIR/state.json"
+FLAG_FILE="${SOLO_DISPLAY_FLAG_FILE:-$HOME/.local/state/omarchy/toggles/hypr/solo-display.lua}"
+HYPRCTL="${SOLO_DISPLAY_HYPRCTL:-hyprctl}"
+SETTLE_TIMEOUT="${SOLO_DISPLAY_SETTLE_TIMEOUT:-8}"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
+# ------------------------------------------------------------------- helpers
+
+notify() {
+  [[ -n ${SOLO_DISPLAY_QUIET:-} ]] && return 0
+  omarchy-notification-send -g 󰍹 "$@" >/dev/null 2>&1 || true
+}
+
+die() {
+  echo "solo-display: $*" >&2
+  notify "Solo display" "$*"
+  exit 1
+}
+
+hypr() {
+  "$HYPRCTL" "$@"
+}
+
+dispatch() {
+  hypr dispatch "$1" >/dev/null
+}
+
+# Connector names end up inside generated Lua and dispatcher strings, so only
+# plain names may pass.
+safe_name() {
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+is_active() {
+  [[ -f $STATE_FILE ]]
+}
+
+refresh_shell_config() {
+  [[ -n ${SOLO_DISPLAY_NO_SHELL:-} ]] && return 0
+  omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
+}
+
+# This plugin's inline settings from shell.json, or {}.
+plugin_entry() {
+  [[ -s $CONFIG_FILE ]] || { echo '{}'; return; }
+  jq -c --arg id "$PLUGIN_ID" '
+    first(.bar.layout[]?[]? | select(type == "object" and .id == $id)) // {}
+  ' "$CONFIG_FILE" 2>/dev/null || echo '{}'
+}
+
+# setting <entry-json> <key> <default>
+setting() {
+  jq -r --arg key "$2" --arg fallback "$3" '
+    .[$key] as $v
+    | if $v == null then $fallback
+      elif ($v | type) == "array" then $v | map(tostring) | join(",")
+      else $v | tostring end
+  ' <<<"$1"
+}
+
+# Expands "1-5,7" (or "1 2 3") into one workspace id per line, sorted, unique.
+expand_ids() {
+  local spec="${1//[[:space:]]/,}" part a b n
+  local -a parts
+  IFS=',' read -ra parts <<<"$spec"
+  for part in "${parts[@]}"; do
+    if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=$((10#${BASH_REMATCH[1]}))
+      b=$((10#${BASH_REMATCH[2]}))
+      ((a > b)) && { n=$a; a=$b; b=$n; }
+      ((b - a > 100)) && b=$((a + 100))
+      for ((n = a; n <= b; n++)); do ((n > 0)) && echo "$n"; done
+    elif [[ $part =~ ^[0-9]+$ ]]; then
+      n=$((10#$part))
+      ((n > 0)) && echo "$n"
+    fi
+  done | sort -nu
+}
+
+# wait_for <jq args...>: polls `hyprctl monitors -j` until the jq expression
+# holds, so later dispatches see the reloaded display layout.
+wait_for() {
+  local deadline=$((SECONDS + SETTLE_TIMEOUT))
+  while ((SECONDS < deadline)); do
+    hypr monitors -j | jq -e "$@" >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+write_atomically() {
+  local target="$1" tmp
+  mkdir -p "$(dirname "$target")"
+  tmp=$(mktemp "$target.XXXXXX")
+  cat >"$tmp"
+  mv -f "$tmp" "$target"
+}
+
+update_shell_config() {
+  local program="$1" next
+  shift
+  [[ -s $CONFIG_FILE ]] || return 0
+  next=$(jq -S -e "$@" "$program" "$CONFIG_FILE") || return 1
+  write_atomically "$CONFIG_FILE" <<<"$next"
+  refresh_shell_config
+}
+
+JQ_IDOF='def idof: if type == "object" then (.id // "" | tostring) else tostring end;'
+
+# ------------------------------------------------- workspace widget swapping
+
+# Where the widget to suspend sits in the bar, as {section, index, entry} or null.
+locate_widget() {
+  [[ -n $1 && -s $CONFIG_FILE ]] || { echo null; return; }
+  jq -c --arg id "$1" "$JQ_IDOF"'
+    first(.bar.layout | to_entries[] | .key as $section
+      | .value | to_entries[] | select(.value | idof == $id)
+      | {section: $section, index: .key, entry: .value}) // null
+  ' "$CONFIG_FILE"
+}
+
+# Swaps the suspended widget for the replacement in place (or just removes it
+# when the replacement is already on the bar). Its full entry, settings
+# included, is kept in the state file so `off` can put it back verbatim.
+suspend_widget() {
+  local suspended="$1"
+  [[ $suspended != null ]] || return 0
+  update_shell_config "$JQ_IDOF"'
+    if $s.added
+      then .bar.layout[$s.section][$s.index] = {id: $s.replacement}
+      else .bar.layout[$s.section] |= del(.[$s.index])
+    end
+  ' --argjson s "$suspended"
+}
+
+restore_widget() {
+  local suspended="$1"
+  [[ $suspended != null ]] || return 0
+  update_shell_config "$JQ_IDOF"'
+    ($s.entry | idof) as $id
+    | if any(.bar.layout[]?[]?; idof == $id) then
+        # Already back on the bar (re-added by hand): only drop our stand-in.
+        if $s.added then .bar.layout |= map_values(map(select(idof != $s.replacement))) else . end
+      else
+        [.bar.layout | to_entries[] | .key as $section
+          | .value | to_entries[] | select(.value | idof == $s.replacement)
+          | {section: $section, index: .key}] as $stand_ins
+        | (($stand_ins | map(select(.section == $s.section)) | first) // ($stand_ins | first)) as $at
+        | if $s.added and $at != null then
+            .bar.layout[$at.section][$at.index] = $s.entry
+          else
+            (.bar.layout[$s.section] // []) as $list
+            | ([$s.index, ($list | length)] | min) as $i
+            | .bar.layout[$s.section] = $list[:$i] + [$s.entry] + $list[$i:]
+          end
+      end
+  ' --argjson s "$suspended"
+}
+
+# ---------------------------------------------------------------- hyprland
+
+# write_flag <target> <ids-json> <others...>
+write_flag() {
+  local target="$1" ids="$2" other id
+  shift 2
+  {
+    echo "-- Generated by $PLUGIN_ID while solo display mode is on."
+    echo "-- 'solo-display off' deletes this file; edits here are overwritten."
+    for other in "$@"; do
+      printf 'hl.monitor({ output = "%s", disabled = true })\n' "$other"
+    done
+    for id in $(jq -r '.[]' <<<"$ids"); do
+      printf 'hl.workspace_rule({ workspace = "%d", monitor = "%s" })\n' "$id" "$target"
+    done
+    # If the one display left is unplugged nothing would be lit, so end solo
+    # mode from inside Hyprland, which doesn't depend on the shell being alive.
+    if [[ $SELF =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+      cat <<LUA
+hl.on("monitor.removed", function(monitor)
+  local ok, name = pcall(function() return monitor.name end)
+  if ok and name == "$target" then hl.exec_cmd("$SELF off --lost") end
+end)
+LUA
+    fi
+  } | write_atomically "$FLAG_FILE"
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_on() {
+  local target="${1:-}" cfg monitors workspaces ids suspend_id replacement focused_ws
+  local -a others
+
+  if is_active; then
+    echo "solo display is already on ($(jq -r .target "$STATE_FILE"))"
+    return 0
+  fi
+
+  cfg=$(plugin_entry)
+  monitors=$(hypr monitors -j)
+  workspaces=$(hypr workspaces -j)
+  [[ -n $target ]] || target=$(setting "$cfg" monitor "")
+  [[ -n $target ]] || target=$(jq -r 'first(.[] | select(.focused) | .name) // ""' <<<"$monitors")
+
+  safe_name "$target" || die "Invalid display name '$target'"
+  jq -e --arg m "$target" 'any(.[]; .name == $m)' <<<"$monitors" >/dev/null ||
+    die "$target is not an active display"
+
+  mapfile -t others < <(jq -r --arg m "$target" '.[] | select(.name != $m) | .name' <<<"$monitors")
+  for other in "${others[@]}"; do
+    safe_name "$other" || die "Refusing unsafe display name '$other'"
+  done
+
+  ids=$(expand_ids "$(setting "$cfg" workspaces "1-5")" | jq -sc .)
+  suspend_id=$(setting "$cfg" suspendWidget "air.workspaces")
+  replacement=$(setting "$cfg" replaceWith "omarchy.workspaces")
+
+  local suspended
+  suspended=$(locate_widget "$suspend_id")
+  if [[ $suspended != null ]]; then
+    local has_replacement=false
+    if [[ -n $replacement ]] && jq -e --arg id "$replacement" "$JQ_IDOF"'any(.bar.layout[]?[]?; idof == $id)' "$CONFIG_FILE" >/dev/null; then
+      has_replacement=true
+    fi
+    suspended=$(jq -c --arg r "$replacement" --argjson has "$has_replacement" \
+      '. + {replacement: $r, added: ($r != "" and ($has | not))}' <<<"$suspended")
+  fi
+
+  # Snapshot first: if anything below fails, `off` still knows the way back.
+  mkdir -p "$STATE_DIR"
+  jq -n \
+    --arg target "$target" \
+    --argjson ids "$ids" \
+    --argjson monitors "$monitors" \
+    --argjson workspaces "$workspaces" \
+    --argjson suspended "$suspended" '
+    {
+      version: 1,
+      target: $target,
+      workspaceIds: $ids,
+      focusedMonitor: (first($monitors[] | select(.focused) | .name) // null),
+      focusedWorkspace: (first($monitors[] | select(.focused) | .activeWorkspace.id) // null),
+      monitors: [$monitors[] | {name, activeWorkspace: .activeWorkspace.id}],
+      workspaces: [$workspaces[] | select(.id > 0) | {id, monitor}],
+      suspended: $suspended
+    }' | write_atomically "$STATE_FILE"
+
+  suspend_widget "$suspended" || echo "solo-display: could not swap out $suspend_id" >&2
+
+  write_flag "$target" "$ids" "${others[@]}"
+  hypr reload >/dev/null
+  wait_for --arg m "$target" '[.[].name] == [$m]' ||
+    echo "solo-display: displays did not settle within ${SETTLE_TIMEOUT}s" >&2
+
+  local id
+  for id in $(jq -r '.[]' <<<"$ids"); do
+    if hypr workspaces -j | jq -e --argjson id "$id" --arg m "$target" 'any(.[]; .id == $id and .monitor != $m)' >/dev/null; then
+      dispatch "hl.dsp.workspace.move({ workspace = \"$id\", monitor = \"$target\" })"
+    fi
+  done
+
+  # Stay on the workspace that had focus, wherever it used to be shown.
+  focused_ws=$(jq -r '.focusedWorkspace // empty' "$STATE_FILE")
+  if [[ $focused_ws =~ ^[0-9]+$ ]]; then
+    dispatch "hl.dsp.focus({ workspace = \"$focused_ws\" })"
+  fi
+
+  notify "Solo display on" "Only $target is active"
+}
+
+cmd_off() {
+  local reason="${1:-}" state wanted current enabled plan kind ws mon
+
+  if ! is_active; then
+    if [[ -f $FLAG_FILE ]]; then
+      rm -f "$FLAG_FILE"
+      hypr reload >/dev/null
+    fi
+    echo "solo display is already off"
+    return 0
+  fi
+
+  state=$(cat "$STATE_FILE")
+  restore_widget "$(jq -c '.suspended' <<<"$state")" ||
+    echo "solo-display: could not restore the suspended bar widget" >&2
+
+  rm -f "$FLAG_FILE"
+  hypr reload >/dev/null
+
+  # Wait for every display from the snapshot that is still plugged in.
+  wanted=$(hypr monitors all -j | jq -c --argjson s "$state" \
+    '[.[].name] as $connected | [$s.monitors[].name | select(. as $n | $connected | index($n))]')
+  wait_for --argjson w "$wanted" '($w - [.[].name]) | length == 0' ||
+    echo "solo-display: displays did not settle within ${SETTLE_TIMEOUT}s" >&2
+  sleep 0.3
+
+  current=$(hypr workspaces -j)
+  enabled=$(hypr monitors -j)
+  plan=$(restore_plan "$state" "$current" "$enabled")
+
+  while IFS=$'\t' read -r kind ws mon; do
+    [[ -n $kind ]] || continue
+    [[ $ws =~ ^[0-9]+$ ]] && safe_name "$mon" || continue
+    case $kind in
+      move) dispatch "hl.dsp.workspace.move({ workspace = \"$ws\", monitor = \"$mon\" })" ;;
+      focus)
+        dispatch "hl.dsp.focus({ monitor = \"$mon\" })"
+        dispatch "hl.dsp.focus({ workspace = \"$ws\" })"
+        ;;
+    esac
+  done <<<"$plan"
+
+  rm -f "$STATE_FILE"
+
+  if [[ $reason == --lost ]]; then
+    notify "Solo display off" "$(jq -r .target <<<"$state") was disconnected, all displays restored"
+  else
+    notify "Solo display off" "All displays restored"
+  fi
+}
+
+# restore_plan <state> <workspaces> <enabled-monitors>
+# Emits tab-separated steps: "move <ws> <monitor>" for every workspace that is
+# not where the snapshot had it, then "focus <ws> <monitor>" to bring back each
+# display's visible workspace, ending on the display that had focus. Workspaces
+# created while solo mode was on follow the suspended widget's groups, if any.
+restore_plan() {
+  jq -rn --argjson s "$1" --argjson ws "$2" --argjson mons "$3" '
+    def enabled($m): any($mons[]; .name == $m);
+    ($s.workspaces | map({key: (.id | tostring), value: .monitor}) | from_entries) as $saved
+    | ([($s.suspended.entry.groups // [])[]
+        | select(.ids | type == "array") | .monitor as $m | .ids[] | {key: tostring, value: $m}]
+       | from_entries) as $groups
+    | ( $ws[] | select(.id > 0) | . as $w
+        | ($saved[$w.id | tostring] // $groups[$w.id | tostring]) as $want
+        | select($want != null and $want != $w.monitor and enabled($want))
+        | "move\t\($w.id)\t\($want)" ),
+      ( $s.monitors | sort_by(.name == $s.focusedMonitor) | .[]
+        | select(.activeWorkspace != null and .activeWorkspace > 0 and enabled(.name))
+        | "focus\t\(.activeWorkspace)\t\(.name)" )
+  '
+}
+
+cmd_status() {
+  if is_active; then
+    jq -c '{active: true, target, workspaceIds, suspended: (.suspended.entry.id // null)}' "$STATE_FILE"
+  else
+    echo '{"active":false}'
+  fi
+}
+
+usage() {
+  echo "Usage: solo-display <on|off|toggle|status> [--monitor <connector>]"
+}
+
+main() {
+  local command="${1:-toggle}" monitor=""
+  (($# > 0)) && shift
+
+  case $command in
+    -h | --help) usage; return 0 ;;
+    status) cmd_status; return 0 ;;
+  esac
+
+  local reason=""
+  while (($# > 0)); do
+    case $1 in
+      --monitor) monitor="${2:-}"; shift 2 ;;
+      --lost) reason=--lost; shift ;;
+      *) usage >&2; return 1 ;;
+    esac
+  done
+
+  # One change at a time: a double click must not snapshot a half-applied state.
+  mkdir -p "$STATE_DIR"
+  exec 9>"$STATE_DIR/lock"
+  flock -w 30 9 || die "Another solo-display run is still busy"
+
+  case $command in
+    on) cmd_on "$monitor" ;;
+    off) cmd_off "$reason" ;;
+    toggle) if is_active; then cmd_off; else cmd_on "$monitor"; fi ;;
+    *) usage >&2; return 1 ;;
+  esac
+}
+
+# Sourcing (as the tests do) only defines the functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
